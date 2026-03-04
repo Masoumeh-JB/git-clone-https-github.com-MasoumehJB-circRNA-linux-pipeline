@@ -1,0 +1,12 @@
+name: SRR17273744
+tools:
+  bwa: /usr/bin/bwa
+  hisat2: /usr/bin/hisat2
+  stringtie: /usr/bin/stringtie
+  samtools: /usr/bin/samtools
+
+reference:
+  fasta: Path/genome.fa
+  gtf: Path/BWAIndex/gene.gtf
+  bwa_index: Path/BWAIndex/genome.fa
+  hisat_index: Path/hisat2/hg38/genome
