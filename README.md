@@ -1,4 +1,4 @@
-# git-clone-https-github.com-MasoumehJB-circRNA-linux-pipeline
+# circRNA-linux-pipeline
 circRNA-linux-pipeline
 *Complete circRNA + linear RNA pipeline** from SRA to quantification matrices.
 
