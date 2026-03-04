@@ -1,0 +1,13 @@
+#!/bin/bash
+
+output_file="Path/mapped_reads.csv"
+
+echo "Sample,Total_Mapped" > "$output_file"
+
+bam_dir="Path/Total_bam"
+
+for file in "$bam_dir"/*.bam; do
+  sample_name=$(basename "$file" .bam)  
+  mapped_reads=$(samtools flagstat "$file" | grep " mapped (" | awk '{print $1}')  
+  echo "$sample_name,$mapped_reads" >> "$output_file" 
+done
