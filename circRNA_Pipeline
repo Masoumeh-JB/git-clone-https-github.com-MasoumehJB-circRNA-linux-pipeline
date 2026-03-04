@@ -1,0 +1,430 @@
+#!/bin/bash
+
+#######################################
+# CONFIGURATION
+#######################################
+
+# Base project directories (edit these)
+PROJECT_DIR="$HOME/circRNA_project"
+RAW_DIR="$PROJECT_DIR/raw"             # SRA / raw FASTQ input
+WORK_DIR="$PROJECT_DIR/work"           # Output (TopHat2, HISAT2, samtools, CIRIquant, etc.)
+APP_DIR="$PROJECT_DIR/apps"            # Installers (jdk deb, FastQ tool, Anaconda, CIRIquant env)
+INDEX_DIR="$PROJECT_DIR/indexes"       # Genome indices (Bowtie2, HISAT2) + genome fasta
+REF_DIR="$PROJECT_DIR/refs"            # ref.txt and similar reference files
+
+# SRA / HISAT2 / CIRIquant samples (paired-end)
+SAMPLES=("SRR10804438" "SRR10804440" "SRR10804442" "SRR10804443")
+
+# TopHat2-Fusion / CIRCexplorer2 sample (for circ_fusion.txt generation)
+TOPHAT_SAMPLE="SRR17273725"           # example; edit as needed
+
+# Indices and reference paths (edit these to match your indices)
+HISAT2_INDEX="$INDEX_DIR/hisat2/hg38/genome"            # hisat2-build prefix
+BOWTIE2_INDEX="$INDEX_DIR/bowtie2/hg38"                 # Bowtie2 index prefix (no .bt2)
+GENOME_FASTA="$INDEX_DIR/genome/hg38.fa"                # Reference genome FASTA
+CIRC_REF_TXT="$REF_DIR/ref.txt"                         # CIRCexplorer2 ref.txt
+
+# CIRIquant configuration
+CIRIQUANT_ENV_YAML="$APP_DIR/CIRIquant/environment.yaml"
+CIRIQUANT_CONFIG="$APP_DIR/CIRIquant/config.yaml"
+
+# Anaconda settings (for CIRCexplorer2 and CIRIquant environments)
+ANACONDA_SH="$APP_DIR/Anaconda3-2023.09-0-Linux-x86_64.sh"
+ANACONDA_HOME="$HOME/anaconda3"
+
+# FastQC / trimming tool
+JDK_DEB="$APP_DIR/jdk-21_linux-x64_bin.deb"
+FASTQ_TOOL_ARCHIVE="$APP_DIR/123Fastq_v1.3_Binary.rar"
+FASTQ_TOOL_DIR="$APP_DIR/123Fastq_v1.3_Binary"
+
+# Resources
+CORES=8
+MEM_LIMIT_KB=45000000    # ~45 GB
+CPU_THRESHOLD=90         # percent
+
+mkdir -p "$RAW_DIR" "$WORK_DIR" "$APP_DIR" "$INDEX_DIR" "$REF_DIR"
+
+#######################################
+# Utility: system load check
+#######################################
+check_system_load() {
+    while true; do
+        local mem_used cpu_load
+        mem_used=$(free -k | awk '/^Mem:/ {print $3}')
+        cpu_load=$(top -bn1 | awk '/Cpu\(s\)/ {print $2}' | cut -d',' -f1)
+        cpu_load=${cpu_load%%.*}
+        cpu_load=${cpu_load:-0}
+
+        if [[ "$mem_used" -lt "$MEM_LIMIT_KB" && "$cpu_load" -lt "$CPU_THRESHOLD" ]]; then
+            break
+        else
+            echo "High system load (CPU: ${cpu_load}%, Mem: $((mem_used/1024)) MB). Waiting..."
+            sleep 60
+        fi
+    done
+}
+
+#######################################
+# 1. SRA-TOOLKIT: prefetch + fastq-dump
+#######################################
+setup_sra_toolkit() {
+    sudo apt update
+    sudo apt install -y sra-toolkit bc
+}
+
+run_sra_download() {
+    setup_sra_toolkit
+
+    # Example: download for all SAMPLES; edit list if needed.
+    for SAMPLE in "${SAMPLES[@]}"; do
+        local sra_path sample_trim_dir
+        sra_path="$RAW_DIR/${SAMPLE}.sra"
+        sample_trim_dir="$RAW_DIR/${SAMPLE}/trimming"
+        if [[ ! -f "$sra_path" ]]; then
+            echo "Downloading SRA: $SAMPLE"
+            prefetch "$SAMPLE" -O "$RAW_DIR"
+        fi
+        mkdir -p "$sample_trim_dir"
+        if [[ ! -f "$sample_trim_dir/${SAMPLE}_1.fastq" && ! -f "$sample_trim_dir/${SAMPLE}.fastq" ]]; then
+            echo "Converting SRA to FASTQ: $SAMPLE"
+            fastq-dump --split-3 "$sra_path" --outdir "$sample_trim_dir"
+        fi
+    done
+}
+
+#######################################
+# 2. FASTQC / Trimming (manual)
+#######################################
+setup_fastqc_trimming() {
+    if [[ ! -d "/usr/lib/jvm/jdk-21-oracle-x64" && -f "$JDK_DEB" ]]; then
+        sudo dpkg -i "$JDK_DEB"
+        sudo update-alternatives --install /usr/bin/java java /usr/lib/jvm/jdk-21-oracle-x64/bin/java 1
+    fi
+
+    if [[ -f "$FASTQ_TOOL_ARCHIVE" && ! -d "$FASTQ_TOOL_DIR" ]]; then
+        cd "$APP_DIR"
+        unrar x "$(basename "$FASTQ_TOOL_ARCHIVE")"
+    fi
+
+    echo "Run trimming manually, for example:"
+    echo "  cd \"$FASTQ_TOOL_DIR\""
+    echo "  java -jar 123Fastq.jar"
+    echo "and trim files in: $RAW_DIR/<SAMPLE>/trimming/"
+}
+
+#######################################
+# 3. Python 2.7 (for TopHat2 etc.)
+#######################################
+setup_python2() {
+    if command -v python2.7 >/dev/null 2>&1; then
+        return
+    fi
+
+    local py_ver="2.7.18"
+    local py_src="Python-${py_ver}"
+
+    sudo apt install -y build-essential checkinstall \
+        libncursesw5-dev libssl-dev libsqlite3-dev \
+        tk-dev libgdbm-dev libc6-dev libbz2-dev libffi-dev \
+        libreadline-dev zlib1g-dev curl
+
+    cd /tmp
+    if [[ ! -f "${py_src}.tgz" ]]; then
+        wget "https://www.python.org/ftp/python/${py_ver}/${py_src}.tgz"
+    fi
+    rm -rf "$py_src"
+    tar -xvf "${py_src}.tgz"
+    cd "$py_src"
+    ./configure --enable-optimizations
+    make -j"$(nproc)"
+    sudo make install
+
+    cd /tmp
+    curl -L "https://bootstrap.pypa.io/pip/2.7/get-pip.py" -o get-pip.py
+    sudo python2.7 get-pip.py
+
+    if command -v python3 >/dev/null 2>&1; then
+        sudo update-alternatives --install /usr/bin/python python "$(command -v python2.7)" 1
+        sudo update-alternatives --install /usr/bin/python python "$(command -v python3)" 2
+    fi
+}
+
+#######################################
+# 4. TopHat2-Fusion + CIRCexplorer2
+#######################################
+run_tophat2_fusion() {
+    local sample="$1"
+    local is_single_end="$2"  # "true" or "false"
+    local trimmed_dir="$RAW_DIR/${sample}/trimming"
+    local out_dir="$WORK_DIR/${sample}/tophat2"
+
+    mkdir -p "$out_dir"
+    cd "$APP_DIR/tophat2" || { echo "TopHat2 not found at $APP_DIR/tophat2"; exit 1; }
+
+    check_system_load
+
+    if [[ "$is_single_end" == "true" ]]; then
+        local fq="${trimmed_dir}/${sample}_Trimmed.fastq"
+        ./tophat2 \
+            -p "$CORES" \
+            --keep-fasta-order \
+            --fusion-search \
+            -o "$out_dir" \
+            "$BOWTIE2_INDEX" \
+            "$fq"
+    else
+        local fp="${trimmed_dir}/${sample}_ForwardPairs.fastq"
+        local rp="${trimmed_dir}/${sample}_ReversePairs.fastq"
+        local fup="${trimmed_dir}/${sample}_ForwardUnpairs.fastq"
+        local rup="${trimmed_dir}/${sample}_ReverseUnpairs.fastq"
+        ./tophat2 \
+            -p "$CORES" \
+            --keep-fasta-order \
+            --fusion-search \
+            --library-type fr-unstranded \
+            -o "$out_dir" \
+            "$BOWTIE2_INDEX" \
+            "$fp" \
+            "$rp" \
+            "$fup" \
+            "$rup"
+    fi
+}
+
+setup_anaconda() {
+    if [[ -d "$ANACONDA_HOME" ]]; then
+        return
+    fi
+    if [[ ! -f "$ANACONDA_SH" ]]; then
+        echo "Anaconda installer not found at $ANACONDA_SH"
+        echo "Download Anaconda3 and place the .sh file there."
+        exit 1
+    fi
+    chmod +x "$ANACONDA_SH"
+    bash "$ANACONDA_SH" -b -p "$ANACONDA_HOME" -q
+}
+
+setup_circexplorer2() {
+    setup_anaconda
+    # shellcheck source=/dev/null
+    source "$ANACONDA_HOME/etc/profile.d/conda.sh"
+    conda activate base
+
+    if ! conda env list | grep -q "^py2 "; then
+        conda create -n py2 python=2.7 -y
+    fi
+
+    conda activate py2
+
+    if ! command -v CIRCexplorer2 >/dev/null 2>&1; then
+        conda install -c bioconda circexplorer2 -y
+    fi
+}
+
+run_circexplorer2_parse() {
+    local sample="$1"
+    local is_paired="$2"  # "true"/"false"
+    local bam="$WORK_DIR/${sample}/tophat2/accepted_hits.bam"
+    local out_dir="$WORK_DIR/${sample}/fast_Circ"
+
+    if [[ ! -f "$bam" ]]; then
+        echo "TopHat2 BAM not found for $sample: $bam"
+        exit 1
+    fi
+    if [[ ! -f "$CIRC_REF_TXT" ]]; then
+        echo "ref.txt not found: $CIRC_REF_TXT"
+        exit 1
+    fi
+    if [[ ! -f "$GENOME_FASTA" ]]; then
+        echo "Genome FASTA not found: $GENOME_FASTA"
+        exit 1
+    fi
+
+    mkdir -p "$out_dir"
+
+    # shellcheck source=/dev/null
+    source "$ANACONDA_HOME/etc/profile.d/conda.sh"
+    conda activate py2
+
+    local pe_flag=""
+    if [[ "$is_paired" == "true" ]]; then
+        pe_flag="--pe"
+    fi
+
+    fast_circ.py parse \
+        -r "$CIRC_REF_TXT" \
+        -g "$GENOME_FASTA" \
+        $pe_flag \
+        -t TopHat-Fusion \
+        -o "$out_dir" \
+        "$bam"
+}
+
+#######################################
+# 5. HISAT2 alignment (batch)
+#######################################
+run_hisat2_batch() {
+    sudo apt install -y hisat2 samtools
+
+    for SAMPLE in "${SAMPLES[@]}"; do
+        echo "HISAT2: $SAMPLE"
+        check_system_load
+
+        local trim_dir="$RAW_DIR/$SAMPLE/trimming"
+        local fp="$trim_dir/${SAMPLE}_ForwardPairs.fastq"
+        local rp="$trim_dir/${SAMPLE}_ReversePairs.fastq"
+        local fup="$trim_dir/${SAMPLE}_ForwardUnpairs.fastq"
+        local rup="$trim_dir/${SAMPLE}_ReverseUnpairs.fastq"
+
+        local out_bam="$WORK_DIR/$SAMPLE/Hisat2/hisat2_${SAMPLE}.bam"
+        mkdir -p "$(dirname "$out_bam")"
+
+        hisat2 -t -p "$CORES" -x "$HISAT2_INDEX" \
+            -1 "$fp" \
+            -2 "$rp" \
+            -U "$fup,$rup" \
+        | samtools view -b -F 4 -q 10 -o "$out_bam"
+
+        echo "HISAT2 done for $SAMPLE. Sleeping 5 minutes..."
+        sleep 300
+    done
+}
+
+#######################################
+# 6–7. samtools sort + index (batch)
+#######################################
+run_samtools_sort_index_batch() {
+    for SAMPLE in "${SAMPLES[@]}"; do
+        echo "samtools: $SAMPLE"
+        check_system_load
+
+        local in_bam="$WORK_DIR/$SAMPLE/Hisat2/hisat2_${SAMPLE}.bam"
+        local sorted_bam="$WORK_DIR/$SAMPLE/samtools/${SAMPLE}_sorted.bam"
+        mkdir -p "$(dirname "$sorted_bam")"
+
+        samtools sort -@"$CORES" -o "$sorted_bam" "$in_bam"
+        samtools index "$sorted_bam"
+
+        echo "samtools done for $SAMPLE. Sleeping 3 minutes..."
+        sleep 180
+    done
+}
+
+#######################################
+# 8. CIRIquant (batch)
+#######################################
+setup_ciriquant_env() {
+    setup_anaconda
+    # shellcheck source=/dev/null
+    source "$ANACONDA_HOME/etc/profile.d/conda.sh"
+    if ! conda env list | grep -q "^CIRIquant "; then
+        conda env create -f "$CIRIQUANT_ENV_YAML"
+    fi
+}
+
+run_ciriquant_batch() {
+    setup_ciriquant_env
+    # shellcheck source=/dev/null
+    source "$ANACONDA_HOME/etc/profile.d/conda.sh"
+    conda activate CIRIquant
+
+    for SAMPLE in "${SAMPLES[@]}"; do
+        echo "CIRIquant: $SAMPLE"
+
+        local trim_dir="$RAW_DIR/$SAMPLE/trimming"
+        local fp="$trim_dir/${SAMPLE}_ForwardPairs.fastq"
+        local rp="$trim_dir/${SAMPLE}_ReversePairs.fastq"
+        local sorted_bam="$WORK_DIR/$SAMPLE/samtools/${SAMPLE}_sorted.bam"
+        local circ_file="$WORK_DIR/$SAMPLE/fast_Circ/annotate/circ_fusion.txt"
+        local out_dir="$WORK_DIR/$SAMPLE/CIRIquant"
+
+        if [[ ! -f "$fp" || ! -f "$rp" || ! -f "$sorted_bam" || ! -f "$circ_file" ]]; then
+            echo "Required files missing for $SAMPLE. Skipping."
+            continue
+        fi
+
+        # Update name field in config
+        if [[ -f "$CIRIQUANT_CONFIG" ]]; then
+            sed -i "1s/.*/name: $SAMPLE/" "$CIRIQUANT_CONFIG"
+        fi
+
+        check_system_load
+
+        CIRIquant --config "$CIRIQUANT_CONFIG" \
+                  -1 "$fp" \
+                  -2 "$rp" \
+                  -o "$out_dir" \
+                  -t "$CORES" \
+                  --circ "$circ_file" \
+                  --tool CIRCexplorer2 \
+                  --bam "$sorted_bam" \
+                  -p "$SAMPLE"
+
+        echo "CIRIquant done for $SAMPLE. Sleeping 30 seconds..."
+        sleep 30
+    done
+}
+
+#######################################
+# 9. prep_CIRIquant (manual step)
+#######################################
+prep_ciriquant_note() {
+    cat <<EOF
+prep_CIRIquant step is not automated here because it depends on
+project-specific guide and library files. After CIRIquant has run:
+
+  1) Activate environment:
+       conda activate CIRIquant
+
+  2) Prepare guide file(s) per dataset, for example:
+       \$PROJECT_DIR/prepCIRIquant/guidprepCIRIquant.txt
+
+  3) Run:
+       prep_CIRIquant -i /path/to/guidprepCIRIquant.txt \\
+                      --lib lib.txt \\
+                      --circ circfinal.txt \\
+                      --bsj expressionsfinal.txt \\
+                      --ratio ratio.txt
+
+Output files are written in the active conda environment's working directory;
+move them to your project directories as needed.
+EOF
+}
+
+#######################################
+# MAIN PIPELINE
+#######################################
+main() {
+    echo "Starting circRNA pipeline."
+
+    # 1) SRA toolkit + download + fastq-dump (optional; comment out if you start from FASTQ)
+    # run_sra_download
+
+    # 2) FastQC / trimming (manual GUI)
+    setup_fastqc_trimming
+
+    # 3) Python 2.7 for legacy tools (TopHat2, CIRCexplorer2)
+    setup_python2
+
+    # 4) TopHat2-Fusion + CIRCexplorer2 for one sample (edit flags as needed)
+    # Example: paired-end TopHat2 for TOPHAT_SAMPLE, then CIRCexplorer2 parse
+    run_tophat2_fusion "$TOPHAT_SAMPLE" "false"
+    setup_circexplorer2
+    run_circexplorer2_parse "$TOPHAT_SAMPLE" "true"
+
+    # 5) HISAT2 alignment for all SAMPLES
+    run_hisat2_batch
+
+    # 6–7) samtools sort + index
+    run_samtools_sort_index_batch
+
+    # 8) CIRIquant quantification
+    run_ciriquant_batch
+
+    # 9) prep_CIRIquant (manual)
+    prep_ciriquant_note
+
+    echo "Pipeline completed."
+}
+
+main "$@"
